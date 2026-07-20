@@ -1,22 +1,40 @@
 #!/usr/bin/env python3
 """
-Direct Python port of tensile_stage_strain_controlled_3_5_26.ino
-This code is used for the tensile stage with the load cell and smaller
-stepper motor with integrated lead screw.
+Python port of tensile_stage_strain_controlled_3_5_26.ino, updated for:
+  - TMC2208 stepper driver (EN hardwired to GND, MS1/MS2 wired directly
+    to VIO -- confirmed via BigTreeTech's documented truth table to give
+    1/16 microstepping. Recommend empirically verifying stepsize below by
+    commanding a known step count and measuring actual stage travel.)
+  - Adafruit HX711 load cell amplifier (SCK on GPIO6, DATA on GPIO5)
 
-Ported for Raspberry Pi (RPi.GPIO). Command set, math, and control flow
-are kept identical to the original Arduino sketch. No functional changes.
+Command set and motor/fatigue logic are kept identical to the original
+sketch. HX711 support (tare/calibrate/force) is new functionality that
+did not exist in the original Arduino code.
 """
 
 import time
 import RPi.GPIO as GPIO
 
+# -------------------------------------------------------
+# Stepper driver (TMC2208) pins
+# EN is hardwired directly to GND on this build -- always enabled,
+# no GPIO pin needed or used for it.
+# MS1/MS2 are wired directly to VIO (not to the Pi) -- this fixes
+# microstep resolution at 1/16 per BigTreeTech's documented truth table.
+# Not yet empirically verified against actual measured stage travel.
+# -------------------------------------------------------
+stpP = 17
+dirP = 27
 
-enaP = 2
-stpP = 3
-dirP = 4
-ms1 = 5
-ms2 = 6
+# -------------------------------------------------------
+# HX711 load cell amplifier pins
+# -------------------------------------------------------
+HX711_SCK = 6
+HX711_DATA = 5
+HX711_READS_TARE = 15       # samples averaged for a tare reading
+HX711_READS_CALIBRATION = 15  # samples averaged for a calibration reading
+HX711_READS_FORCE = 3       # samples averaged for a live force reading
+G = 9.80665                 # N per kg, for grams -> Newtons conversion
 
 # The lowest possible stepsize at 1/16 microstepping is 0.3125um.
 # If changing microstepping, change this value
@@ -42,6 +60,11 @@ j = 0  # unused, kept for fidelity with original sketch
 # This initializes the direction variable. 1 for pull, -1 for push
 dir = 1
 
+# HX711 state: set by tare() and calibrate() commands. Both start unset --
+# force readings are refused until calibrate() has been run at least once.
+tare_offset = 0.0
+calibration_factor = None  # counts per gram
+
 initialLength = 4000.0  # um - unstretched gauge length of sample
 returnLength = 4142.0   # um - target return stretched length of sample
 finalLength = 4240.0    # um - target stretched length of sample
@@ -52,17 +75,15 @@ def setup():
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
 
-    GPIO.setup(enaP, GPIO.OUT)
     GPIO.setup(stpP, GPIO.OUT)
     GPIO.setup(dirP, GPIO.OUT)
-    GPIO.setup(ms1, GPIO.OUT)
-    GPIO.setup(ms2, GPIO.OUT)
-
     GPIO.output(dirP, GPIO.LOW)
+    # No EN, MS1, or MS2 setup -- EN is hardwired to GND (always enabled),
+    # and MS1/MS2 are not connected to the Pi (fixed by board wiring).
 
-    # Microstepping: (H,H) = 1/16
-    GPIO.output(ms1, GPIO.HIGH)
-    GPIO.output(ms2, GPIO.HIGH)
+    GPIO.setup(HX711_SCK, GPIO.OUT)
+    GPIO.setup(HX711_DATA, GPIO.IN)
+    GPIO.output(HX711_SCK, GPIO.LOW)
 
     print("Welcome to the Tensile Stage VB.5, Strain-Controlled Fatigue Version")
     print("Type help to view available commands")
@@ -70,6 +91,7 @@ def setup():
     print("The displacement has been zeroed")
     print(f"The current step size is (um): {stepsize}")
     print(f"The current strain rate is (um/s): {strainrate}")
+    print("Load cell is NOT calibrated yet. Run 'tare' then 'calibrate' before using 'force'.")
 
 
 # -------------------------------------------------------
@@ -108,6 +130,105 @@ def moveToPosition(targetUm):
     # if delta == 0, already at target
 
 
+# -------------------------------------------------------
+# HX711: low-level raw read (bit-banged, no external library)
+# Returns one signed 24-bit reading, channel A, gain 128 (default).
+# -------------------------------------------------------
+def hx711_read_raw():
+    # DATA goes LOW when a new conversion is ready. This blocks until then --
+    # at the default 10 Hz rate that's up to ~100ms; faster if RATE is wired high.
+    while GPIO.input(HX711_DATA) == 1:
+        pass
+
+    count = 0
+    for _ in range(24):
+        GPIO.output(HX711_SCK, GPIO.HIGH)
+        count = count << 1
+        GPIO.output(HX711_SCK, GPIO.LOW)
+        if GPIO.input(HX711_DATA):
+            count += 1
+
+    # 25th pulse selects channel A, gain 128 for the *next* reading
+    GPIO.output(HX711_SCK, GPIO.HIGH)
+    GPIO.output(HX711_SCK, GPIO.LOW)
+
+    # convert unsigned 24-bit value to signed (two's complement)
+    if count & 0x800000:
+        count -= 0x1000000
+
+    return count
+
+
+def hx711_read_average(num_readings):
+    total = 0
+    for _ in range(num_readings):
+        total += hx711_read_raw()
+    return total / num_readings
+
+
+# -------------------------------------------------------
+# Load cell zero point. Re-run at the start of each session/sample --
+# this is a snapshot, not a fixed hardware property.
+# -------------------------------------------------------
+def tare():
+    global tare_offset
+    print("Taring -- make sure nothing is on the load cell.")
+    print("Press Enter when ready.")
+    input()
+    tare_offset = hx711_read_average(HX711_READS_TARE)
+    print(f"Tare complete. Offset = {tare_offset:.1f} counts")
+
+
+# -------------------------------------------------------
+# Determines counts-per-gram for THIS load cell + HX711 pair, using a
+# known weight. Only needs to be re-run if the hardware or gain changes --
+# unlike tare, this value should stay valid across sessions.
+# -------------------------------------------------------
+def calibrate():
+    global calibration_factor
+    print("--- Calibration ---")
+    print("Make sure the load cell has NO weight on it, then press Enter.")
+    input()
+    zero_reading = hx711_read_average(HX711_READS_CALIBRATION)
+
+    known_mass = None
+    while known_mass is None:
+        try:
+            val = input("Place a known weight on the load cell and enter its mass in grams: ").strip()
+            known_mass = float(val)
+        except ValueError:
+            print("Please enter a number.")
+
+    print("Reading...")
+    loaded_reading = hx711_read_average(HX711_READS_CALIBRATION)
+
+    delta = loaded_reading - zero_reading
+    if delta == 0:
+        print("ERROR: no change detected between zero and loaded readings. Calibration failed.")
+        return
+
+    calibration_factor = delta / known_mass
+    print(f"Calibration complete. Factor = {calibration_factor:.4f} counts/gram")
+    print("Note this number down. To skip this step next time, hardcode it by")
+    print("setting calibration_factor directly near the top of the script.")
+
+
+def read_force_grams():
+    if calibration_factor is None:
+        print("Not calibrated yet. Run 'calibrate' first.")
+        return None
+    raw = hx711_read_average(HX711_READS_FORCE)
+    return (raw - tare_offset) / calibration_factor
+
+
+def force_cmd():
+    grams = read_force_grams()
+    if grams is None:
+        return
+    newtons = (grams / 1000.0) * G
+    print(f"Force: {grams:.2f} g  ({newtons:.4f} N)")
+
+
 def help_cmd():
     print("pull: changes motor direction to pull")
     print("push: changes motor direction to push")
@@ -117,6 +238,9 @@ def help_cmd():
     print("fatigue: runs strain-controlled fatigue cycling.")
     print("The current position is used as the baseline.")
     print("The motor cycles (finalLength - initialLength) um above it.")
+    print("tare: zeroes the load cell baseline (run with no weight on the cell)")
+    print("calibrate: determines the load cell's counts-per-gram using a known weight")
+    print("force: prints the current force reading in grams and Newtons")
 
 
 def movestep():
@@ -218,6 +342,12 @@ def loop():
             help_cmd()
         elif command == "fatigue":
             fatigue()
+        elif command == "tare":
+            tare()
+        elif command == "calibrate":
+            calibrate()
+        elif command == "force":
+            force_cmd()
         else:
             print("I'm sorry, I don't understand that command. Please type help to view available commands")
 
