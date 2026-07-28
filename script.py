@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
 Python port of tensile_stage_strain_controlled_3_5_26.ino, updated for:
-  - TMC2208 stepper driver (EN hardwired to GND, MS1/MS2 wired directly
-    to VIO -- confirmed via BigTreeTech's documented truth table to give
-    1/16 microstepping. Recommend empirically verifying stepsize below by
-    commanding a known step count and measuring actual stage travel.)
+  - TMC2208 stepper driver (MS1/MS2 wired directly to VIO -- confirmed via
+    BigTreeTech's documented truth table to give 1/16 microstepping.
+    EN is wired to Pi GPIO22, NOT GND -- see EN control note below.)
   - Adafruit HX711 load cell amplifier (SCK on GPIO6, DATA on GPIO5)
 
 Command set and motor/fatigue logic are kept identical to the original
 sketch. HX711 support (tare/calibrate/force) is new functionality that
 did not exist in the original Arduino code.
+
+EN control: EN was originally hardwired to GND (always enabled), which
+kept continuous holding current through the coils at all times -- a
+contributing factor in the failure analysis of the original Pi 4 (see
+project history: transients from continuously-energized coils sharing
+a ground path with the Pi killed GPIO17 and the 3.3V rail). EN is now
+wired to GPIO22 and actively toggled: LOW (enabled) for the full duration
+of any move AND for fatigue's 10-second dwell between reversals (holding
+force preserved where the test relies on it), HIGH (disabled, no current)
+when idle waiting for commands. Requires the physical EN-to-GPIO22 jumper
+to be in place -- if EN is still tied to GND, this code runs harmlessly
+but the driver stays always-enabled regardless.
 """
 
 import time
@@ -17,12 +28,12 @@ import RPi.GPIO as GPIO
 
 # -------------------------------------------------------
 # Stepper driver (TMC2208) pins
-# EN is hardwired directly to GND on this build -- always enabled,
-# no GPIO pin needed or used for it.
+# EN on GPIO22: active-low (LOW = enabled, HIGH = disabled), per
+# BigTreeTech's documentation. Driver starts DISABLED at script launch.
 # MS1/MS2 are wired directly to VIO (not to the Pi) -- this fixes
 # microstep resolution at 1/16 per BigTreeTech's documented truth table.
-# Not yet empirically verified against actual measured stage travel.
 # -------------------------------------------------------
+enP = 22
 stpP = 17
 dirP = 27
 
@@ -75,11 +86,13 @@ def setup():
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
 
+    GPIO.setup(enP, GPIO.OUT)
+    GPIO.output(enP, GPIO.HIGH)  # start DISABLED -- no coil current until a command runs
+
     GPIO.setup(stpP, GPIO.OUT)
     GPIO.setup(dirP, GPIO.OUT)
     GPIO.output(dirP, GPIO.LOW)
-    # No EN, MS1, or MS2 setup -- EN is hardwired to GND (always enabled),
-    # and MS1/MS2 are not connected to the Pi (fixed by board wiring).
+    # MS1/MS2 not set up here -- not connected to the Pi (fixed by board wiring).
 
     GPIO.setup(HX711_SCK, GPIO.OUT)
     GPIO.setup(HX711_DATA, GPIO.IN)
@@ -92,6 +105,20 @@ def setup():
     print(f"The current step size is (um): {stepsize}")
     print(f"The current strain rate is (um/s): {strainrate}")
     print("Load cell is NOT calibrated yet. Run 'tare' then 'calibrate' before using 'force'.")
+    print("Driver is DISABLED at idle -- automatically enabled during moves and fatigue.")
+
+
+# -------------------------------------------------------
+# EN control: LOW = enabled (current flowing), HIGH = disabled (no current)
+# Verify with a multimeter: EN-to-GND should read ~3.3V at idle,
+# ~0V during a commanded move.
+# -------------------------------------------------------
+def enable_driver():
+    GPIO.output(enP, GPIO.LOW)
+
+
+def disable_driver():
+    GPIO.output(enP, GPIO.HIGH)
 
 
 # -------------------------------------------------------
@@ -241,6 +268,7 @@ def help_cmd():
     print("tare: zeroes the load cell baseline (run with no weight on the cell)")
     print("calibrate: determines the load cell's counts-per-gram using a known weight")
     print("force: prints the current force reading in grams and Newtons")
+    print("Note: driver is only enabled during moves/fatigue; idle = disabled (no coil current)")
 
 
 def movestep():
@@ -319,29 +347,53 @@ def loop():
         elif command == "zero":
             zero()
         elif command == "step":
+            enable_driver()
             movestep()
+            disable_driver()
         elif command == "1":
+            enable_driver()
             moveDistance(1, dir)
+            disable_driver()
         elif command == "5":
+            enable_driver()
             moveDistance(5, dir)
+            disable_driver()
         elif command == "10":
+            enable_driver()
             moveDistance(10, dir)
+            disable_driver()
         elif command == "50":
+            enable_driver()
             moveDistance(50, dir)
+            disable_driver()
         elif command == "100":
+            enable_driver()
             moveDistance(100, dir)
+            disable_driver()
         elif command == "250":
+            enable_driver()
             moveDistance(250, dir)
+            disable_driver()
         elif command == "500":
+            enable_driver()
             moveDistance(500, dir)
+            disable_driver()
         elif command == "1000":
+            enable_driver()
             moveDistance(1000, dir)
+            disable_driver()
         elif command == "3000":
+            enable_driver()
             moveDistance(3000, dir)
+            disable_driver()
         elif command == "help":
             help_cmd()
         elif command == "fatigue":
+            # Enabled for the ENTIRE fatigue run, including the 10s dwells --
+            # holding force preserved where the test relies on it.
+            enable_driver()
             fatigue()
+            disable_driver()
         elif command == "tare":
             tare()
         elif command == "calibrate":
@@ -359,4 +411,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            disable_driver()
+        except Exception:
+            pass
         GPIO.cleanup()
