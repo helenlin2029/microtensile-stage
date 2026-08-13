@@ -23,6 +23,7 @@ pad, and the battery negative terminal. If VIO is already fed from the
 Pi's 3.3 V you probably have this, but measure it rather than assume.
 """
 
+import threading
 import time
 
 from gpiozero import DigitalOutputDevice, PWMOutputDevice
@@ -53,6 +54,12 @@ SWEEP_START_HZ = 100.0
 SWEEP_STOP_HZ  = 1000.0
 SWEEP_TIME_S   = 1.0
 
+# Dead-man timer: 'run' auto-stops after this many seconds so a forgotten
+# or unattended run cannot drive the carriage into a hard stop. At 1 kHz
+# and 1/8 microstepping this is roughly 2 mm of travel - already well past
+# the 240 um span of the tensile test. Set to None to disable.
+MAX_RUN_S = 3.0
+
 # ---------------- mechanics (for the readout only) ----------------
 FULL_STEPS_PER_REV = 200
 MICROSTEPS         = 8       # floating MS pins on a TMC2209 = 1/8
@@ -73,6 +80,7 @@ def main():
 
     freq = FREQ_HZ
     running = False
+    deadman = [None]     # holds the auto-stop timer, if armed
 
     def report():
         ss = LEAD_UM / (FULL_STEPS_PER_REV * MICROSTEPS)
@@ -110,10 +118,23 @@ Commands:
                 elif cmd[0] == "run":
                     if en:
                         en.on()
+                    if deadman[0]:
+                        deadman[0].cancel()
                     step.value = DUTY
                     running = True
-                    print("  running")
+                    if MAX_RUN_S:
+                        def _cutoff():
+                            step.value = 0.0
+                            print(f"\n  [auto-stopped after {MAX_RUN_S} s]")
+                        deadman[0] = threading.Timer(MAX_RUN_S, _cutoff)
+                        deadman[0].daemon = True
+                        deadman[0].start()
+                        print(f"  running (auto-stop in {MAX_RUN_S} s)")
+                    else:
+                        print("  running")
                 elif cmd[0] == "stop":
+                    if deadman[0]:
+                        deadman[0].cancel()
                     step.value = 0.0
                     running = False
                     print("  stopped")
@@ -183,6 +204,8 @@ Commands:
             except (IndexError, ValueError):
                 print("  bad argument")
     finally:
+        if deadman[0]:
+            deadman[0].cancel()
         step.value = 0.0
         step.close()
         dirp.close()
